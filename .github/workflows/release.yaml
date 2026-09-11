@@ -1,0 +1,471 @@
+name: release
+
+# shell: bash gives -eo pipefail, so a script failing before a pipe (classify |
+# tee) fails the step; the implicit default is bash -e without pipefail.
+defaults:
+  run:
+    shell: bash
+
+# Reusable workflow: publish a component from a version tag.
+#
+#   vX.Y.Z-rcN   rc path   multi-arch images -> Harbor, optional chart -> Harbor
+#                          OCI, GitHub pre-release with notes since the previous
+#                          rc. Nothing reaches docker.io.
+#   vX.Y.Z       GA path   no build: the newest rc's images are copied by digest
+#                          to docker.io (+ latest when it is the highest GA), the
+#                          chart is re-packaged for docker.io OCI, release notes
+#                          are drafted and the backport label is deleted.
+#
+# `classify` refuses a GA tag that is not the exact commit of the newest rc, or
+# whose rc-validation status is not success (once RC_VALIDATION_ENFORCE=true),
+# before anything is published: what was validated is what ships. Tags are
+# created only by cut-release / tag-release with the release App token.
+#
+# Harbor is reachable only from the in-network runner (`runner` input); every
+# job that pushes to or pulls from Harbor runs there, and arm64 is built under
+# QEMU on that runner. GitHub-hosted runners do the rest.
+#
+# Variables (all prefixed CLOUD_COMPONENT_): HARBOR_REGISTRY (host/project), DOCKERHUB_REGISTRY, SLACK_CHANNEL_ID,
+#            RC_VALIDATION_ENFORCE.
+# Secrets (inherit): HARBOR_USERNAME, HARBOR_PASSWORD, DOCKERHUB_USERNAME,
+#            DOCKERHUB_PASSWORD, SLACK_OAUTH_TOKEN.
+# Caller permissions: contents: write, issues: write (label deletion),
+#            statuses: read (rc-validation).
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: "Image names without registry, space separated, e.g. k8s-dra-driver-npu"
+        required: true
+        type: string
+      release_name:
+        description: "Prefix of the GitHub release title, e.g. RBLN DRA Driver for NPUs"
+        required: true
+        type: string
+      chart_dir:
+        description: "Helm chart directory; empty skips the chart steps"
+        required: false
+        default: ""
+        type: string
+      chart_rc_values:
+        description: "yq expression applied to <chart_dir>/values.yaml before packaging the rc chart, e.g. '.image.registry = env(HARBOR_HOST)'; empty leaves values untouched"
+        required: false
+        default: ""
+        type: string
+      runner:
+        description: "Runner label with network access to Harbor"
+        required: false
+        default: rbln-sw-k8s-general
+        type: string
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_PASSWORD:
+        required: true
+      SLACK_OAUTH_TOKEN:
+        required: false
+    outputs:
+      kind:
+        description: "rc | ga"
+        value: ${{ jobs.classify.outputs.kind }}
+      version:
+        description: "X.Y.Z"
+        value: ${{ jobs.classify.outputs.version }}
+      branch:
+        description: "release-X.Y.Z"
+        value: ${{ jobs.classify.outputs.branch }}
+      last_rc:
+        description: "Newest rc tag of this version (the tag itself on the rc path)"
+        value: ${{ jobs.classify.outputs.last_rc }}
+      sha:
+        description: "Commit the tag points at"
+        value: ${{ jobs.classify.outputs.sha }}
+      latest:
+        description: "GA path: whether latest was moved"
+        value: ${{ jobs.ga-promote.outputs.latest }}
+      digests:
+        description: "GA path: one <image>=sha256:... line per image"
+        value: ${{ jobs.ga-promote.outputs.digests }}
+      draft_url:
+        description: "GA path: URL of the draft release"
+        value: ${{ jobs.draft-release.outputs.url }}
+
+env:
+  HARBOR_REGISTRY: ${{ vars.CLOUD_COMPONENT_HARBOR_REGISTRY }}
+  DOCKERHUB_REGISTRY: ${{ vars.CLOUD_COMPONENT_DOCKERHUB_REGISTRY }}
+  IMAGES: ${{ inputs.images }}
+  CHART_DIR: ${{ inputs.chart_dir }}
+  YQ_VERSION: v4.53.6
+  REGCTL_VERSION: v0.11.6
+
+jobs:
+  classify:
+    name: Classify ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.c.outputs.kind }}
+      version: ${{ steps.c.outputs.version }}
+      branch: ${{ steps.c.outputs.branch }}
+      last_rc: ${{ steps.c.outputs.last_rc }}
+      sha: ${{ steps.c.outputs.sha }}
+    steps:
+      - name: Require registry variables
+        run: |
+          for v in HARBOR_REGISTRY DOCKERHUB_REGISTRY IMAGES; do
+            [ -n "${!v}" ] || { echo "::error::$v is empty; set organization variable CLOUD_COMPONENT_$v (for IMAGES: the images input)"; exit 1; }
+          done
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Classify tag and enforce invariants
+        id: c
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_VALIDATION_ENFORCE: ${{ vars.CLOUD_COMPONENT_RC_VALIDATION_ENFORCE }}
+        run: .release-kit/scripts/classify-tag.sh "$GITHUB_REF_NAME" | tee -a "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- rc path --
+
+  rc-images:
+    name: rc images (amd64 + arm64) -> Harbor
+    needs: classify
+    if: needs.classify.outputs.kind == 'rc'
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Derive the Harbor host
+        run: echo "HARBOR_HOST=${HARBOR_REGISTRY%%/*}" >> "$GITHUB_ENV"
+      - name: Install prerequisites
+        run: |
+          if ! command -v docker &>/dev/null; then
+            curl -fsSL https://get.docker.com | sudo sh
+            sudo usermod -aG docker "$USER"
+            sudo chmod 666 /var/run/docker.sock
+          fi
+          if ! command -v make &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y make
+          fi
+      - name: Set up QEMU for arm64 emulation
+        uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.HARBOR_HOST }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Login to Docker Hub for base-image pulls
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Build and push (multi-arch) through the Makefile contract
+        run: |
+          set -euo pipefail
+          for img in $IMAGES; do
+            make build-image IMAGE_NAME="$HARBOR_REGISTRY/$img" VERSION="$GITHUB_REF_NAME" \
+              BUILD_MULTI_PLATFORM=true PUSH_ON_BUILD=true
+          done
+      - name: Verify both platforms are present
+        run: |
+          set -euo pipefail
+          for img in $IMAGES; do
+            docker buildx imagetools inspect "$HARBOR_REGISTRY/$img:$GITHUB_REF_NAME" | tee inspect.out
+            for p in linux/amd64 linux/arm64; do
+              grep -q "$p" inspect.out || { echo "::error::$img:$GITHUB_REF_NAME is missing $p"; exit 1; }
+            done
+          done
+
+  rc-chart:
+    name: rc chart -> Harbor OCI
+    needs: [classify, rc-images]
+    if: inputs.chart_dir != ''
+    runs-on: ${{ inputs.runner }}
+    env:
+      CHART_RC_VALUES: ${{ inputs.chart_rc_values }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Derive the Harbor host
+        run: echo "HARBOR_HOST=${HARBOR_REGISTRY%%/*}" >> "$GITHUB_ENV"
+      - uses: azure/setup-helm@v5
+      - name: Install yq
+        run: |
+          mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
+          chmod +x "$HOME/.local/bin/yq"
+      # The rc chart must resolve this component's image from Harbor; the caller
+      # says how through chart_rc_values because values layouts differ per chart.
+      - name: Point the rc chart at Harbor
+        if: env.CHART_RC_VALUES != ''
+        run: yq -i "$CHART_RC_VALUES" "$CHART_DIR/values.yaml"
+      - name: Package chart
+        run: |
+          set -euo pipefail
+          if yq -e '.dependencies' "$CHART_DIR/Chart.yaml" >/dev/null 2>&1; then
+            helm dependency build "$CHART_DIR"
+          fi
+          mkdir -p dist
+          helm package "$CHART_DIR" --destination dist \
+            --version "${GITHUB_REF_NAME#v}" --app-version "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist/*.tgz
+      - name: Push chart to Harbor
+        run: |
+          echo "${{ secrets.HARBOR_PASSWORD }}" | \
+            helm registry login "$HARBOR_HOST" -u "${{ secrets.HARBOR_USERNAME }}" --password-stdin
+          helm push dist/*.tgz "oci://$HARBOR_REGISTRY"
+
+  rc-prerelease:
+    name: rc GitHub pre-release
+    needs: [classify, rc-images, rc-chart]
+    # rc-chart is skipped without a chart; run in that case too.
+    if: always() && needs.rc-images.result == 'success' && (needs.rc-chart.result == 'success' || needs.rc-chart.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Release notes since the previous rc (or the previous GA)
+        env:
+          VERSION: ${{ needs.classify.outputs.version }}
+        run: |
+          set -euo pipefail
+          . .release-kit/scripts/lib.sh
+          prev=$(git tag -l "v${VERSION}-rc[0-9]*" | sort -V | awk -v cur="$GITHUB_REF_NAME" '$0 == cur { print p; exit } { p = $0 }')
+          [ -n "$prev" ] || prev=$(prev_ga_tag "v$VERSION")
+          .release-kit/scripts/release-notes.sh "$GITHUB_REF_NAME" "$prev" release_notes.md
+          {
+            echo "> Release candidate. Images${CHART_DIR:+ and chart} are on \`$HARBOR_REGISTRY\`; nothing has been published to docker.io."
+            echo
+            cat release_notes.md
+          } > body.md
+      - uses: actions/download-artifact@v8
+        if: inputs.chart_dir != ''
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          prerelease: true
+          tag_name: ${{ github.ref_name }}
+          name: "${{ inputs.release_name }} ${{ github.ref_name }} (release candidate)"
+          body_path: body.md
+          files: dist/*.tgz
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  rc-notify:
+    name: rc summary -> Slack
+    needs: [classify, rc-images, rc-chart, rc-prerelease]
+    if: always() && needs.classify.outputs.kind == 'rc'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Notify Slack
+        env:
+          SLACK_OAUTH_TOKEN: ${{ secrets.SLACK_OAUTH_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.CLOUD_COMPONENT_SLACK_CHANNEL_ID }}
+          R_IMAGES: ${{ needs.rc-images.result }}
+          R_CHART: ${{ needs.rc-chart.result }}
+          R_PRERELEASE: ${{ needs.rc-prerelease.result }}
+          BRANCH: ${{ needs.classify.outputs.branch }}
+        run: |
+          mark() { case "$1" in success) echo ":white_check_mark:";; failure) echo ":x:";; cancelled) echo ":no_entry_sign:";; skipped) echo ":fast_forward:";; *) echo ":grey_question:";; esac; }
+          color=good
+          for r in "$R_IMAGES" "$R_CHART" "$R_PRERELEASE"; do
+            case $r in failure|cancelled) color=danger;; esac
+          done
+          rows="$(mark "$R_IMAGES") Images → \`$HARBOR_REGISTRY\` (\`$GITHUB_REF_NAME\`, amd64 + arm64)
+          $(mark "$R_CHART") Helm chart → Harbor OCI
+          $(mark "$R_PRERELEASE") GitHub pre-release"
+          .release-kit/scripts/slack-notify.sh --color "$color" --details "$rows" \
+            --link "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME|pre-release" \
+            --title ":package: *${GITHUB_REPOSITORY#*/}* · *$GITHUB_REF_NAME* · rc published" \
+            "Validate it, then \`tag-release ga\` on \`$BRANCH\` promotes exactly these digests to docker.io."
+
+  # ---------------------------------------------------------------- GA path --
+
+  ga-promote:
+    name: GA promote rc digests -> docker.io
+    needs: classify
+    if: needs.classify.outputs.kind == 'ga'
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      latest: ${{ steps.copy.outputs.latest }}
+      digests: ${{ steps.copy.outputs.digests }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Derive the Harbor host
+        run: echo "HARBOR_HOST=${HARBOR_REGISTRY%%/*}" >> "$GITHUB_ENV"
+      - name: Install regctl
+        run: |
+          mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64" \
+            -o "$HOME/.local/bin/regctl"
+          chmod +x "$HOME/.local/bin/regctl"
+      - name: Registry logins
+        run: |
+          regctl registry login "$HARBOR_HOST" -u "${{ secrets.HARBOR_USERNAME }}" -p "${{ secrets.HARBOR_PASSWORD }}"
+          regctl registry login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_PASSWORD }}"
+      - name: Copy the validated rc images by digest (no rebuild)
+        id: copy
+        env:
+          LAST_RC: ${{ needs.classify.outputs.last_rc }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin '+refs/tags/*:refs/tags/*'
+          # shellcheck disable=SC2086
+          .release-kit/scripts/promote-images.sh "$LAST_RC" "$GITHUB_REF_NAME" "$HARBOR_REGISTRY" "$DOCKERHUB_REGISTRY" $IMAGES
+
+  ga-chart:
+    name: GA chart -> docker.io OCI
+    needs: [classify, ga-promote]
+    if: inputs.chart_dir != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - name: Install yq
+        run: |
+          mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
+          chmod +x "$HOME/.local/bin/yq"
+      - name: Package chart (pristine values)
+        run: |
+          set -euo pipefail
+          if yq -e '.dependencies' "$CHART_DIR/Chart.yaml" >/dev/null 2>&1; then
+            helm dependency build "$CHART_DIR"
+          fi
+          mkdir -p dist
+          helm package "$CHART_DIR" --destination dist \
+            --version "${GITHUB_REF_NAME#v}" --app-version "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist/*.tgz
+      - name: Push chart to Docker Hub OCI
+        run: |
+          echo "${{ secrets.DOCKERHUB_PASSWORD }}" | \
+            helm registry login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          helm push dist/*.tgz "oci://$DOCKERHUB_REGISTRY"
+
+  draft-release:
+    name: GA release notes (draft)
+    needs: [classify, ga-promote, ga-chart]
+    if: always() && needs.ga-promote.result == 'success' && (needs.ga-chart.result == 'success' || needs.ga-chart.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.release.outputs.url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      # The previous GA is the highest GA tag below this one, not "the tag before
+      # this one in history": release branches make git describe unreliable.
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          . .release-kit/scripts/lib.sh
+          prev=$(prev_ga_tag "$GITHUB_REF_NAME")
+          echo "previous GA: ${prev:-<none>}"
+          .release-kit/scripts/release-notes.sh "$GITHUB_REF_NAME" "$prev" release_notes.md
+      - uses: actions/download-artifact@v8
+        if: inputs.chart_dir != ''
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        id: release
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          name: "${{ inputs.release_name }} ${{ github.ref_name }} Release"
+          body_path: release_notes.md
+          files: dist/*.tgz
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ga-finish:
+    name: GA close-out
+    needs: [classify, ga-promote, ga-chart, draft-release]
+    if: always() && needs.classify.outputs.kind == 'ga'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      # No label, no bot: backports to a released branch become impossible.
+      - name: Delete the backport label
+        if: needs.ga-promote.result == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh label delete "backport ${{ needs.classify.outputs.branch }}" --yes --repo "$GITHUB_REPOSITORY" || echo "::notice::label already gone"
+      - name: Notify Slack
+        env:
+          SLACK_OAUTH_TOKEN: ${{ secrets.SLACK_OAUTH_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.CLOUD_COMPONENT_SLACK_CHANNEL_ID }}
+          R_PROMOTE: ${{ needs.ga-promote.result }}
+          R_CHART: ${{ needs.ga-chart.result }}
+          R_NOTES: ${{ needs.draft-release.result }}
+          DRAFT_URL: ${{ needs.draft-release.outputs.url }}
+          LAST_RC: ${{ needs.classify.outputs.last_rc }}
+          LATEST: ${{ needs.ga-promote.outputs.latest }}
+          BRANCH: ${{ needs.classify.outputs.branch }}
+        run: |
+          mark() { case "$1" in success) echo ":white_check_mark:";; failure) echo ":x:";; cancelled) echo ":no_entry_sign:";; skipped) echo ":fast_forward:";; *) echo ":grey_question:";; esac; }
+          color=good
+          for r in "$R_PROMOTE" "$R_CHART" "$R_NOTES"; do
+            case $r in failure|cancelled) color=danger;; esac
+          done
+          tags="\`$GITHUB_REF_NAME\`"; [ "$LATEST" = true ] && tags="$tags, \`latest\`"
+          rows="$(mark "$R_PROMOTE") Images promoted from \`$LAST_RC\` by digest → \`$DOCKERHUB_REGISTRY\` ($tags)
+          $(mark "$R_CHART") Helm chart \`${GITHUB_REF_NAME#v}\` → docker.io OCI
+          $(mark "$R_NOTES") Release notes drafted
+          Backport label \`backport $BRANCH\` removed; the branch is read-only now"
+          links=()
+          [ -n "$DRAFT_URL" ] && links+=(--link "$DRAFT_URL|draft release")
+          .release-kit/scripts/slack-notify.sh --color "$color" ${links[@]+"${links[@]}"} --details "$rows" \
+            --title ":rocket: *${GITHUB_REPOSITORY#*/}* · *$GITHUB_REF_NAME* · GA" \
+            "*Release manager:* review and publish the draft release."

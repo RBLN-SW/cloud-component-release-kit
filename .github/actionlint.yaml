@@ -1,0 +1,11 @@
+# actionlint configuration for the kit's own CI.
+#
+# The reusable workflows check out the kit itself with the job.workflow_repository
+# and job.workflow_sha context properties (the called workflow's repository and
+# commit, independent of the caller). GitHub documents them at
+# https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+# but actionlint (<= 1.7.12) does not know them yet. Ignore only that message.
+paths:
+  .github/workflows/**/*.yaml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'

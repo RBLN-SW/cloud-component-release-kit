@@ -1,0 +1,57 @@
+name: release-policy
+
+# shell: bash gives -eo pipefail, so a script failing before a pipe (classify |
+# tee) fails the step; the implicit default is bash -e without pipefail.
+defaults:
+  run:
+    shell: bash
+
+# Reusable workflow: required status check for pull requests into release-*
+# branches. Proves that every change is a fix already merged on main, carried
+# over unchanged (or a labelled, justified exception). See
+# scripts/release-policy.sh for the seven checks.
+#
+# The caller's stub (templates/workflows/release-policy.yaml) runs on
+# pull_request for release-* including labeled/unlabeled, because two checks
+# depend on the release-only / backport-manual labels.
+#
+# Status-check context: "<caller job id> / release-policy". The stub's job id is
+# release-policy, so the context the rulesets require is
+# "release-policy / release-policy". Do not rename either.
+
+on:
+  workflow_call:
+    inputs:
+      generated_paths:
+        description: "Pathspecs excluded from the advisory size check, space separated"
+        required: false
+        default: "vendor go.sum *zz_generated*"
+        type: string
+
+jobs:
+  release-policy:
+    name: release-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+
+      - name: Check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GENERATED_PATHS: ${{ inputs.generated_paths }}
+        run: .release-kit/scripts/release-policy.sh
