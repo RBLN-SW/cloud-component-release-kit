@@ -1,0 +1,49 @@
+name: ci
+
+# The kit's own checks: shell scripts (shellcheck + bats), workflows and
+# templates (actionlint). Runs on every PR and on main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  BATS_VERSION: v1.14.0
+
+jobs:
+  shell:
+    name: shellcheck + bats
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck and bats
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+          git clone -q --depth 1 -b "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+      - name: shellcheck
+        run: shellcheck -x -P SCRIPTDIR scripts/*.sh tests/helpers.bash
+      - name: bats
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+          bats tests
+
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install actionlint
+        run: |
+          bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION" /usr/local/bin
+      - name: actionlint (kit workflows)
+        run: actionlint -color .github/workflows/*.yaml
+      - name: actionlint (caller templates)
+        run: actionlint -color templates/workflows/*.yaml

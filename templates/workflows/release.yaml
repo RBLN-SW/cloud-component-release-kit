@@ -1,0 +1,31 @@
+name: release
+
+# Publish from a version tag: vX.Y.Z-rcN -> Harbor, vX.Y.Z -> docker.io by
+# digest. Tags are created by cut-release / tag-release only.
+# Everything else lives in the release kit: https://github.com/RBLN-SW/cloud-component-release-kit
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  issues: write # GA deletes the "backport release-X.Y.Z" label
+  statuses: read # GA reads the rc-validation commit status
+
+jobs:
+  release:
+    uses: RBLN-SW/cloud-component-release-kit/.github/workflows/release.yaml@v1
+    with:
+      # Image names under the registry (HARBOR_REGISTRY / DOCKERHUB_REGISTRY),
+      # space separated.
+      images: CHANGE-ME
+      # Prefix of the GitHub release title.
+      release_name: CHANGE-ME
+      # Helm chart directory, or remove both chart lines if there is no chart.
+      chart_dir: ""
+      # yq expression that points the rc chart's image at Harbor, e.g.
+      # '.image.registry = env(HARBOR_HOST)'.
+      chart_rc_values: ""
+    secrets: inherit

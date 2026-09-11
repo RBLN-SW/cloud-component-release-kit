@@ -1,0 +1,146 @@
+name: tag-release
+
+# shell: bash gives -eo pipefail, so a script failing before a pipe (classify |
+# tee) fails the step; the implicit default is bash -e without pipefail.
+defaults:
+  run:
+    shell: bash
+
+# Reusable workflow: tag the HEAD of a release branch as the next rc, or as GA.
+#
+# Two ways in, both through the caller's stub (templates/workflows/tag-release.yaml):
+#   - a release manager runs the stub from the Actions tab (`kind` = rc or ga)
+#   - a PR labelled `tag-rc` is merged into a release-* branch: the next rc is
+#     tagged automatically, so the release manager's approval doubles as the
+#     "publish an rc now" decision. GA is never automatic.
+#
+# The tag push is what starts release.yaml; this workflow publishes nothing.
+# scripts/tag-release.sh refuses to tag when HEAD already carries an rc tag,
+# when the version already went GA, or (for ga) when HEAD is not the newest
+# rc's commit or that commit's rc-validation status is not success (enforced
+# once the repository variable RC_VALIDATION_ENFORCE is "true"). Reading the
+# status needs the App permission "Commit statuses: read".
+#
+# Variables (all prefixed CLOUD_COMPONENT_): RELEASE_APP_ID, RELEASE_TEAM, SLACK_CHANNEL_ID, RC_VALIDATION_ENFORCE.
+# Secrets (inherit): CLOUD_COMPONENT_RELEASE_APP_PRIVATE_KEY, SLACK_OAUTH_TOKEN.
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: "Release branch, e.g. release-0.7.0"
+        required: true
+        type: string
+      kind:
+        description: "rc | ga"
+        required: true
+        type: string
+    secrets:
+      CLOUD_COMPONENT_RELEASE_APP_PRIVATE_KEY:
+        required: true
+      SLACK_OAUTH_TOKEN:
+        required: false
+    outputs:
+      tag:
+        description: "The tag that was created"
+        value: ${{ jobs.tag.outputs.tag }}
+
+jobs:
+  tag:
+    name: tag ${{ inputs.branch }} (${{ inputs.kind }})
+    # The github context is the caller's: dispatch always runs; a PR event only
+    # when the PR merged with the tag-rc label.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'tag-rc'))
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      RELEASE_TEAM: ${{ vars.CLOUD_COMPONENT_RELEASE_TEAM }}
+      BRANCH: ${{ inputs.branch }}
+      KIND: ${{ inputs.kind }}
+    steps:
+      - name: Require release variables
+        env:
+          RELEASE_APP_ID: ${{ vars.CLOUD_COMPONENT_RELEASE_APP_ID }}
+        run: |
+          for v in RELEASE_APP_ID RELEASE_TEAM; do
+            [ -n "${!v}" ] || { echo "::error::variable CLOUD_COMPONENT_$v is empty; set it as an organization (or repository) variable"; exit 1; }
+          done
+
+      - name: Mint release App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CLOUD_COMPONENT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CLOUD_COMPONENT_RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Require release-manager team membership
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          if ! gh api "orgs/${{ github.repository_owner }}/teams/${RELEASE_TEAM}/memberships/${{ github.actor }}" \
+               --jq '.state' 2>/dev/null | grep -qx active; then
+            echo "::error::${{ github.actor }} is not an active member of ${{ github.repository_owner }}/${RELEASE_TEAM}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Check out the release kit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+
+      - name: Tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BOT: ${{ steps.app.outputs.app-slug }}[bot]
+          RC_VALIDATION_ENFORCE: ${{ vars.CLOUD_COMPONENT_RC_VALIDATION_ENFORCE }}
+        run: |
+          git config user.name "$BOT"
+          git config user.email "$BOT@users.noreply.github.com"
+          # Keep the guard's ERROR line for the Slack message.
+          set +e
+          .release-kit/scripts/tag-release.sh "$BRANCH" "$KIND" 2>&1 | tee tag.log
+          rc=${PIPESTATUS[0]}
+          echo "reason=$(grep -m1 '^ERROR: ' tag.log | sed 's/^ERROR: //')" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_OAUTH_TOKEN: ${{ secrets.SLACK_OAUTH_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.CLOUD_COMPONENT_SLACK_CHANNEL_ID }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          REASON: ${{ steps.tag.outputs.reason }}
+        run: |
+          repo=${GITHUB_REPOSITORY#*/}
+          trigger="${{ github.actor }}"
+          [ "${{ github.event_name }}" = "pull_request" ] && trigger="merge of PR #${{ github.event.pull_request.number }} (\`tag-rc\`)"
+          if [ "${{ job.status }}" = "success" ]; then
+            if [ "$KIND" = ga ]; then
+              .release-kit/scripts/slack-notify.sh --color good --title ":rocket: *$repo* · *$TAG* · GA tagged on \`$BRANCH\`" \
+                "• Triggered by $trigger
+          • release.yaml is promoting the validated rc by digest to docker.io"
+            else
+              .release-kit/scripts/slack-notify.sh --color info --title ":label: *$repo* · *$TAG* · new release candidate on \`$BRANCH\`" \
+                "• Triggered by $trigger
+          • release.yaml is publishing to Harbor"
+            fi
+          else
+            .release-kit/scripts/slack-notify.sh --color danger --title ":x: *$repo* · tag-release $KIND on \`$BRANCH\` refused" \
+              "• Triggered by $trigger
+          • ${REASON:-No guard message captured; see the workflow run}"
+          fi
