@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
 	*) echo "unknown argument: $1" >&2; echo "$usage" >&2; exit 2 ;;
 	esac
 done
-[ -n "$team" ] && [ -n "$app_id" ] || { echo "$usage" >&2; exit 2; }
+if [ -z "$team" ] || [ -z "$app_id" ]; then echo "$usage" >&2; exit 2; fi
 [ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 org=${repo%%/*}
 
