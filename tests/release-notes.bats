@@ -69,3 +69,55 @@ teardown() { teardown_repo; }
 	grep -q 'feat: first' "$TEST_TMP/notes.md"
 	grep -q '_Generated for v0.1.0._' "$TEST_TMP/notes.md"
 }
+
+@test "an executable RELEASE_NOTES_EXTRA is run and its output appended" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	printf '#!/usr/bin/env bash\necho "| generated | $GITHUB_REPOSITORY |"\n' >"$TEST_TMP/extra.sh"
+	chmod +x "$TEST_TMP/extra.sh"
+	RELEASE_NOTES_EXTRA="$TEST_TMP/extra.sh" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -eq 0 ]
+	grep -q '| generated | acme/widget |' "$TEST_TMP/notes.md"
+}
+
+@test "a RELEASE_NOTES_EXTRA that is not a file fails" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	RELEASE_NOTES_EXTRA="$TEST_TMP/missing.md" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"is not a file"* ]]
+}
+
+@test "a script given as a bare name runs from the checkout, not from PATH" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	printf '#!/usr/bin/env bash\necho "| bare | name |"\n' >extra.sh
+	chmod +x extra.sh
+	RELEASE_NOTES_EXTRA=extra.sh run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -eq 0 ]
+	grep -q '| bare | name |' "$TEST_TMP/notes.md"
+}
+
+@test "a script without the executable bit fails instead of being pasted" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	printf '#!/usr/bin/env bash\necho nope\n' >"$TEST_TMP/extra.sh"
+	RELEASE_NOTES_EXTRA="$TEST_TMP/extra.sh" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"not executable"* ]]
+}
+
+@test "a markdown file with the executable bit is appended, not run" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	echo "| plain | markdown |" >"$TEST_TMP/extra.md"
+	chmod +x "$TEST_TMP/extra.md"
+	RELEASE_NOTES_EXTRA="$TEST_TMP/extra.md" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -eq 0 ]
+	grep -q '| plain | markdown |' "$TEST_TMP/notes.md"
+}
