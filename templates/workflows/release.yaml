@@ -28,4 +28,13 @@ jobs:
       # yq expression that points the rc chart's image at Harbor, e.g.
       # '.image.registry = env(HARBOR_HOST)'.
       chart_rc_values: ""
+      # Helm repositories the chart's dependencies come from, "name=url" space
+      # separated; empty when the chart has no dependencies.
+      chart_repos: ""
+      # Executable (or markdown file) whose output is appended to the release
+      # notes, e.g. a table of the images this component pins. Empty for none.
+      release_notes_extra: ""
+      # Set false when this repository adds its own jobs after `release` and
+      # posts one Slack summary for the whole run itself.
+      notify: true
     secrets: inherit

@@ -13,8 +13,9 @@
 #   - a main commit whose sha appears as a trailer in the previous GA's own
 #     backports: that fix already shipped in the previous release.
 # Commits are grouped by Conventional Commit type. If RELEASE_NOTES_EXTRA names
-# a file, its content is appended after Known Issues (repositories that pin
-# other images, like the operator, put their component table there).
+# an executable, its output is appended after Known Issues; a plain file is
+# appended as-is (repositories that pin other images, like the operator,
+# generate their component table there). A path that is neither fails.
 
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -83,8 +84,14 @@ improvements=$(for t in docs refactor perf style build chore test ci; do get "$t
 	echo "## Known Issues"
 	echo "- TBD"
 	echo
-	if [ -n "${RELEASE_NOTES_EXTRA:-}" ] && [ -f "$RELEASE_NOTES_EXTRA" ]; then
-		cat "$RELEASE_NOTES_EXTRA"
+	if [ -n "${RELEASE_NOTES_EXTRA:-}" ]; then
+		if [ -x "$RELEASE_NOTES_EXTRA" ]; then
+			"$RELEASE_NOTES_EXTRA"
+		elif [ -f "$RELEASE_NOTES_EXTRA" ]; then
+			cat "$RELEASE_NOTES_EXTRA"
+		else
+			fail "RELEASE_NOTES_EXTRA '$RELEASE_NOTES_EXTRA' is neither an executable nor a file"
+		fi
 		echo
 	fi
 	if [ -n "$prev" ]; then

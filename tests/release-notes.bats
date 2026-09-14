@@ -69,3 +69,23 @@ teardown() { teardown_repo; }
 	grep -q 'feat: first' "$TEST_TMP/notes.md"
 	grep -q '_Generated for v0.1.0._' "$TEST_TMP/notes.md"
 }
+
+@test "an executable RELEASE_NOTES_EXTRA is run and its output appended" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	printf '#!/usr/bin/env bash\necho "| generated | $GITHUB_REPOSITORY |"\n' >"$TEST_TMP/extra.sh"
+	chmod +x "$TEST_TMP/extra.sh"
+	RELEASE_NOTES_EXTRA="$TEST_TMP/extra.sh" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -eq 0 ]
+	grep -q '| generated | acme/widget |' "$TEST_TMP/notes.md"
+}
+
+@test "a RELEASE_NOTES_EXTRA that is neither executable nor file fails" {
+	commit "feat: first" a.txt >/dev/null
+	cut v0.1.0
+	git tag -a v0.1.0 -m ga
+	RELEASE_NOTES_EXTRA="$TEST_TMP/missing.md" run "$SCRIPTS/release-notes.sh" v0.1.0 "" "$TEST_TMP/notes.md"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"neither an executable nor a file"* ]]
+}

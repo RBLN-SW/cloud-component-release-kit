@@ -21,6 +21,10 @@ defaults:
 # before anything is published: what was validated is what ships. Tags are
 # created only by cut-release / tag-release with the release App token.
 #
+# A caller that adds jobs of its own after this workflow (needs: release) reads
+# kind/version/branch/last_rc/sha/digests/draft_url from the outputs and sets
+# notify: false to post one Slack summary for the whole run itself.
+#
 # Harbor is reachable only from the in-network runner (`runner` input); every
 # job that pushes to or pulls from Harbor runs there, and arm64 is built under
 # QEMU on that runner. GitHub-hosted runners do the rest.
@@ -53,6 +57,21 @@ on:
         required: false
         default: ""
         type: string
+      chart_repos:
+        description: "Helm repositories the chart's dependencies come from, name=url space separated, e.g. 'nfd=https://kubernetes-sigs.github.io/node-feature-discovery/charts'; empty adds none"
+        required: false
+        default: ""
+        type: string
+      release_notes_extra:
+        description: "Executable (or markdown file) in the caller repository whose output is appended to the release notes, e.g. a table of the images this component pins; empty appends nothing"
+        required: false
+        default: ""
+        type: string
+      notify:
+        description: "Post the kit's Slack summaries (rc published, GA). Set false when the caller adds jobs after this workflow and posts one summary for the whole run itself"
+        required: false
+        default: true
+        type: boolean
       runner:
         description: "Runner label with network access to Harbor"
         required: false
@@ -203,6 +222,14 @@ jobs:
           mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
           chmod +x "$HOME/.local/bin/yq"
+      # Chart.lock records dependency repositories by URL, but on a fresh runner
+      # helm dependency build still refuses a URL it has no named repository for.
+      - name: Add chart repositories
+        if: inputs.chart_repos != ''
+        env:
+          CHART_REPOS: ${{ inputs.chart_repos }}
+        run: |
+          for r in $CHART_REPOS; do helm repo add "${r%%=*}" "${r#*=}"; done
       # The rc chart must resolve this component's image from Harbor; the caller
       # says how through chart_rc_values because values layouts differ per chart.
       - name: Point the rc chart at Harbor
@@ -246,6 +273,7 @@ jobs:
       - name: Release notes since the previous rc (or the previous GA)
         env:
           VERSION: ${{ needs.classify.outputs.version }}
+          RELEASE_NOTES_EXTRA: ${{ inputs.release_notes_extra }}
         run: |
           set -euo pipefail
           . .release-kit/scripts/lib.sh
@@ -276,7 +304,7 @@ jobs:
   rc-notify:
     name: rc summary -> Slack
     needs: [classify, rc-images, rc-chart, rc-prerelease]
-    if: always() && needs.classify.outputs.kind == 'rc'
+    if: always() && needs.classify.outputs.kind == 'rc' && inputs.notify
     runs-on: ubuntu-latest
     steps:
       - name: Check out the release kit
@@ -362,6 +390,14 @@ jobs:
           mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
           chmod +x "$HOME/.local/bin/yq"
+      # Chart.lock records dependency repositories by URL, but on a fresh runner
+      # helm dependency build still refuses a URL it has no named repository for.
+      - name: Add chart repositories
+        if: inputs.chart_repos != ''
+        env:
+          CHART_REPOS: ${{ inputs.chart_repos }}
+        run: |
+          for r in $CHART_REPOS; do helm repo add "${r%%=*}" "${r#*=}"; done
       - name: Package chart (pristine values)
         run: |
           set -euo pipefail
@@ -401,6 +437,8 @@ jobs:
       # The previous GA is the highest GA tag below this one, not "the tag before
       # this one in history": release branches make git describe unreliable.
       - name: Generate release notes
+        env:
+          RELEASE_NOTES_EXTRA: ${{ inputs.release_notes_extra }}
         run: |
           set -euo pipefail
           . .release-kit/scripts/lib.sh
@@ -443,6 +481,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh label delete "backport ${{ needs.classify.outputs.branch }}" --yes --repo "$GITHUB_REPOSITORY" || echo "::notice::label already gone"
       - name: Notify Slack
+        if: inputs.notify
         env:
           SLACK_OAUTH_TOKEN: ${{ secrets.SLACK_OAUTH_TOKEN }}
           SLACK_CHANNEL_ID: ${{ vars.CLOUD_COMPONENT_SLACK_CHANNEL_ID }}
