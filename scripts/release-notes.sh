@@ -13,9 +13,10 @@
 #   - a main commit whose sha appears as a trailer in the previous GA's own
 #     backports: that fix already shipped in the previous release.
 # Commits are grouped by Conventional Commit type. If RELEASE_NOTES_EXTRA names
-# an executable, its output is appended after Known Issues; a plain file is
-# appended as-is (repositories that pin other images, like the operator,
-# generate their component table there). A path that is neither fails.
+# a file, it is appended after Known Issues: a script (first line "#!") is run
+# and its output appended, anything else is appended as-is (repositories that
+# pin other images, like the operator, generate their component table there).
+# A script without the executable bit, or a path that is not a file, fails.
 
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -85,12 +86,14 @@ improvements=$(for t in docs refactor perf style build chore test ci; do get "$t
 	echo "- TBD"
 	echo
 	if [ -n "${RELEASE_NOTES_EXTRA:-}" ]; then
-		if [ -x "$RELEASE_NOTES_EXTRA" ]; then
-			"$RELEASE_NOTES_EXTRA"
-		elif [ -f "$RELEASE_NOTES_EXTRA" ]; then
-			cat "$RELEASE_NOTES_EXTRA"
+		extra=$RELEASE_NOTES_EXTRA
+		[ -f "$extra" ] || fail "RELEASE_NOTES_EXTRA '$extra' is not a file"
+		if [ "$(head -c 2 "$extra")" = '#!' ]; then
+			[ -x "$extra" ] || fail "RELEASE_NOTES_EXTRA '$extra' is a script but not executable (chmod +x)"
+			# A bare name would be looked up on PATH instead of in the checkout.
+			case $extra in */*) "$extra" ;; *) "./$extra" ;; esac
 		else
-			fail "RELEASE_NOTES_EXTRA '$RELEASE_NOTES_EXTRA' is neither an executable nor a file"
+			cat "$extra"
 		fi
 		echo
 	fi

@@ -63,7 +63,7 @@ on:
         default: ""
         type: string
       release_notes_extra:
-        description: "Executable (or markdown file) in the caller repository whose output is appended to the release notes, e.g. a table of the images this component pins; empty appends nothing"
+        description: "File in the caller repository appended to the release notes: a script (#!, executable) is run and its output appended, a markdown file is appended as-is, e.g. a table of the images this component pins; empty appends nothing"
         required: false
         default: ""
         type: string
@@ -229,7 +229,7 @@ jobs:
         env:
           CHART_REPOS: ${{ inputs.chart_repos }}
         run: |
-          for r in $CHART_REPOS; do helm repo add "${r%%=*}" "${r#*=}"; done
+          for r in $CHART_REPOS; do helm repo add --force-update "${r%%=*}" "${r#*=}"; done
       # The rc chart must resolve this component's image from Harbor; the caller
       # says how through chart_rc_values because values layouts differ per chart.
       - name: Point the rc chart at Harbor
@@ -397,7 +397,7 @@ jobs:
         env:
           CHART_REPOS: ${{ inputs.chart_repos }}
         run: |
-          for r in $CHART_REPOS; do helm repo add "${r%%=*}" "${r#*=}"; done
+          for r in $CHART_REPOS; do helm repo add --force-update "${r%%=*}" "${r#*=}"; done
       - name: Package chart (pristine values)
         run: |
           set -euo pipefail

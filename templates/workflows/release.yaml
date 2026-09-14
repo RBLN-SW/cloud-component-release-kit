@@ -23,7 +23,7 @@ jobs:
       images: CHANGE-ME
       # Prefix of the GitHub release title.
       release_name: CHANGE-ME
-      # Helm chart directory, or remove both chart lines if there is no chart.
+      # Helm chart directory, or remove the chart_* lines if there is no chart.
       chart_dir: ""
       # yq expression that points the rc chart's image at Harbor, e.g.
       # '.image.registry = env(HARBOR_HOST)'.
@@ -31,8 +31,9 @@ jobs:
       # Helm repositories the chart's dependencies come from, "name=url" space
       # separated; empty when the chart has no dependencies.
       chart_repos: ""
-      # Executable (or markdown file) whose output is appended to the release
-      # notes, e.g. a table of the images this component pins. Empty for none.
+      # Script (#!, executable) whose output, or markdown file whose content, is
+      # appended to the release notes, e.g. a table of the images this component
+      # pins. Empty for none.
       release_notes_extra: ""
       # Set false when this repository adds its own jobs after `release` and
       # posts one Slack summary for the whole run itself.
