@@ -63,7 +63,7 @@ on:
         default: ""
         type: string
       release_notes_extra:
-        description: "File in the caller repository appended to the release notes: a script (#!, executable) is run and its output appended, a markdown file is appended as-is, e.g. a table of the images this component pins; empty appends nothing"
+        description: "File in the caller repository appended to the release notes: a script (#!, executable) is run in the checkout with VERSION, HARBOR_REGISTRY, DOCKERHUB_REGISTRY, IMAGES and CHART_DIR set and its output appended, a markdown file is appended as-is, e.g. a table of the images this component pins; empty appends nothing"
         required: false
         default: ""
         type: string
@@ -438,6 +438,7 @@ jobs:
       # this one in history": release branches make git describe unreliable.
       - name: Generate release notes
         env:
+          VERSION: ${{ needs.classify.outputs.version }}
           RELEASE_NOTES_EXTRA: ${{ inputs.release_notes_extra }}
         run: |
           set -euo pipefail
