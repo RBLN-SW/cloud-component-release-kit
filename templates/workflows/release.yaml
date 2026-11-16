@@ -39,3 +39,18 @@ jobs:
       # posts one Slack summary for the whole run itself.
       notify: true
     secrets: inherit
+
+  # Optional internal copy. Runs after the public release finishes; failures
+  # produce warnings. Read outputs.outcome in any caller summary.
+  ga-harbor-images:
+    name: GA images -> Harbor
+    needs: release
+    if: needs.release.outputs.kind == 'ga'
+    uses: RBLN-SW/cloud-component-release-kit/.github/workflows/mirror-ga-images.yaml@v1
+    with:
+      images: CHANGE-ME # same image names as release.with.images above
+      tag: ${{ github.ref_name }}
+      digests: ${{ needs.release.outputs.digests }}
+    secrets:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

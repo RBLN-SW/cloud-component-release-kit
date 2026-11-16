@@ -1,0 +1,113 @@
+name: mirror GA images to Harbor
+
+# Run as a separate caller job after `release` succeeds. Harbor failures produce
+# warnings without failing the caller workflow or its completed public release.
+# Copy the release output digests, never re-resolve mutable RC tags.
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: "Image names without registry, space separated; same list as the release workflow"
+        required: true
+        type: string
+      tag:
+        description: "GA version tag (vX.Y.Z)"
+        required: true
+        type: string
+      digests:
+        description: "The release workflow's digests output: one image=sha256:... line per image"
+        required: true
+        type: string
+      runner:
+        description: "Runner label with network access to Harbor"
+        required: false
+        default: rbln-sw-k8s-general
+        type: string
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
+    outputs:
+      outcome:
+        description: "success if the images were mirrored, warning if the optional Harbor copy did not complete"
+        value: ${{ jobs.mirror.outputs.outcome }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mirror:
+    name: GA images -> Harbor
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    # Also tolerate job-level failures such as a timeout. Ordinary step
+    # failures are handled below so the job completes with a warning output.
+    continue-on-error: true
+    outputs:
+      outcome: ${{ steps.report.outputs.outcome }}
+    env:
+      HARBOR_REGISTRY: ${{ vars.CLOUD_COMPONENT_HARBOR_REGISTRY }}
+      REGCTL_VERSION: v0.11.6
+    steps:
+      - name: Check out the release kit
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Derive the Harbor host
+        id: registry
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          : "${HARBOR_REGISTRY:?CLOUD_COMPONENT_HARBOR_REGISTRY must be configured}"
+          echo "HARBOR_HOST=${HARBOR_REGISTRY%%/*}" >> "$GITHUB_ENV"
+      - name: Install regctl
+        id: regctl
+        if: steps.registry.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64" \
+            -o "$HOME/.local/bin/regctl"
+          chmod +x "$HOME/.local/bin/regctl"
+      - name: Login to Harbor
+        id: login
+        if: steps.regctl.outcome == 'success'
+        continue-on-error: true
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | regctl registry login "$HARBOR_HOST" -u "$HARBOR_USERNAME" --pass-stdin
+      - name: Tag the promoted digests with the GA version in Harbor
+        id: copy
+        if: steps.login.outcome == 'success'
+        continue-on-error: true
+        env:
+          GA_TAG: ${{ inputs.tag }}
+          IMAGES: ${{ inputs.images }}
+          PROMOTED: ${{ inputs.digests }}
+        run: |
+          # shellcheck disable=SC2086
+          .release-kit/scripts/mirror-ga-images.sh "$GA_TAG" $IMAGES
+      - name: Report the optional Harbor copy result
+        id: report
+        if: always()
+        env:
+          COPY_OUTCOME: ${{ steps.copy.outcome }}
+        run: |
+          if [ "$COPY_OUTCOME" = success ]; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+            echo "Harbor GA image copy succeeded." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "outcome=warning" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Harbor GA image copy::Optional Harbor copy did not complete. The public release is unaffected. See this job's logs before retrying."
+            echo "⚠️ Harbor GA image copy did not complete. The public release is unaffected. See this job's logs before retrying." >> "$GITHUB_STEP_SUMMARY"
+          fi
