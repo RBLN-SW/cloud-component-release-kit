@@ -45,12 +45,13 @@ else
 	[ "$rc_sha" = "$sha" ] ||
 		fail "GA tag $tag (${sha:0:12}) is not the commit of $last_rc (${rc_sha:0:12}). Tag a new rc, validate it, then GA. Nothing was published."
 
-	state=$(commit_status_state "$sha" rc-validation)
+	context=$(rc_status_context "$sha" "$last_rc")
+	state=$(commit_status_state "$sha" "$context")
 	if [ "$state" = success ]; then
 		echo "ok    rc-validation on $last_rc (${sha:0:12}) is success" >&2
 	else
 		msg="rc-validation status on $last_rc (${sha:0:12}) is '$state', not 'success'"
-		if [ "${RC_VALIDATION_ENFORCE:-}" = true ]; then
+		if [ "$context" != rc-validation ] || [ "${RC_VALIDATION_ENFORCE:-}" = true ]; then
 			fail "$msg. 'error' means the validation infrastructure failed (rebuild it); 'failure' means the rc is broken (fix on main, cut a new rc); 'none' means it never ran. Nothing was published."
 		fi
 		echo "::warning::$msg; continuing because RC_VALIDATION_ENFORCE is not 'true'" >&2

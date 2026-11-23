@@ -36,8 +36,17 @@ digests=""
 for img in "$@"; do
 	from="$src/$img:$last_rc"
 	to="$dst/$img:$ga_tag"
+	if [ -n "${RELEASE_IMAGE_LOCK:-}" ]; then
+		# Use the digest captured by the RC build, even if the source tag moved.
+		s=$(jq -er --arg ref "$from" '
+			[.components[] | select((.registry + "/" + .repository + ":" + .tag) == $ref)]
+			| select(length == 1) | .[0].digest | select(test("^sha256:[a-f0-9]{64}$"))
+		' "$RELEASE_IMAGE_LOCK")
+		from="$src/$img@$s"
+	else
+		s=$(regctl image digest "$from")
+	fi
 	regctl image copy "$from" "$to"
-	s=$(regctl image digest "$from")
 	d=$(regctl image digest "$to")
 	[ "$s" = "$d" ] || fail "digest changed while copying $img: $s -> $d"
 	if [ "$move_latest" = true ]; then

@@ -60,8 +60,23 @@ repo_slug() {
 	fi
 }
 
-# State of one context in a commit's combined status: success, failure, error,
-# pending, or "none" when the context was never reported. Needs gh + GH_TOKEN.
+# A product may change its operand set without changing the Operator source.
+# Read the opt-in at the tagged commit (including for tags predating this contract).
+rc_status_context() {
+	local sha=$1 tag=$2 manifest mode
+	if ! manifest=$(git show "$sha:.piper/release.yaml" 2>/dev/null); then
+		echo rc-validation
+		return
+	fi
+	mode=$(yq -er '.validationContext // "commit"' <<<"$manifest") || fail "cannot read validationContext at $sha"
+	case "$mode" in
+	per-rc) echo "rc-validation/$tag" ;;
+	commit) echo rc-validation ;;
+	*) fail "unsupported validationContext: $mode" ;;
+	esac
+}
+
+# State of one context in the commit status API. Needs gh + GH_TOKEN.
 commit_status_state() { # <sha> <context>
 	local repo state
 	repo=$(repo_slug)

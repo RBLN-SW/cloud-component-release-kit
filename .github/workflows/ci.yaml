@@ -29,6 +29,8 @@ jobs:
           sudo /tmp/bats/install.sh /usr/local
       - name: shellcheck
         run: shellcheck -x -P SCRIPTDIR scripts/*.sh tests/helpers.bash
+      - name: Release artifact contract tests
+        run: python3 -m unittest discover -s tests -p 'test_artifact_contract.py'
       - name: bats
         run: |
           git config --global user.name ci

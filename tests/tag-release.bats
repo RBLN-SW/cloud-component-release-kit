@@ -79,3 +79,20 @@ teardown() { teardown_repo; }
 	[ "$status" -ne 0 ]
 	[[ "$output" == *"branch must be release-X.Y.Z"* ]]
 }
+
+@test "composition RC may reuse source but GA must pass the new RC-specific context" {
+	mkdir -p .piper
+	printf 'schemaVersion: 1\nvalidationContext: per-rc\n' > .piper/release.yaml
+	git add .piper/release.yaml
+	git commit -qm 'chore: enable composition candidates'
+	cut v0.5.0
+	run "$SCRIPTS/tag-release.sh" release-0.5.0 rc
+	[ "$status" -eq 0 ]
+	[ "$(origin_ref v0.5.0-rc2)" = "$(origin_ref v0.5.0-rc1)" ]
+	STUB_STATUS=success run "$SCRIPTS/tag-release.sh" release-0.5.0 ga
+	[ "$status" -ne 0 ]
+	[ -z "$(origin_ref v0.5.0)" ]
+	stub gh 'echo "{\"statuses\":[{\"context\":\"rc-validation/v0.5.0-rc2\",\"state\":\"success\"}]}"'
+	run "$SCRIPTS/tag-release.sh" release-0.5.0 ga
+	[ "$status" -eq 0 ]
+}

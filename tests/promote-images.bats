@@ -48,3 +48,17 @@ teardown() { teardown_repo; }
 	run "$SCRIPTS/promote-images.sh" v0.5.0-rc1 v0.5.0 harbor.example/proj docker.io/acme
 	[ "$status" -ne 0 ]
 }
+
+@test "contract GA copies the locked RC digest rather than the current tag" {
+	ga v0.4.0
+	git tag -a v0.5.0 -m ga
+	local digest
+	digest="sha256:$(printf '%064d' 1)"
+	export TEST_DIGEST="$digest"
+	stub regctl 'if [ "$1 $2" = "image digest" ]; then echo "$TEST_DIGEST"; fi'
+	export RELEASE_IMAGE_LOCK="$BATS_TEST_TMPDIR/rc.json"
+	jq -n --arg digest "$digest" '{components:{app:{registry:"harbor.test",repository:"proj/app",tag:"v0.5.0-rc1",digest:$digest}}}' > "$RELEASE_IMAGE_LOCK"
+	run "$SCRIPTS/promote-images.sh" v0.5.0-rc1 v0.5.0 harbor.test/proj docker.io/acme app
+	[ "$status" -eq 0 ]
+	grep -Fq "regctl image copy harbor.test/proj/app@$digest docker.io/acme/app:v0.5.0" "$STUB_LOG"
+}
