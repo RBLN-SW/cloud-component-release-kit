@@ -39,6 +39,10 @@ defaults:
 on:
   workflow_call:
     inputs:
+      artifact_contract:
+        description: "Run the caller's .piper/release.yaml contract and persist the exact RC inputs"
+        type: boolean
+        default: false
       images:
         description: "Image names without registry, space separated, e.g. k8s-dra-driver-npu"
         required: true
@@ -110,6 +114,9 @@ on:
       digests:
         description: "GA path: one <image>=sha256:... line per image"
         value: ${{ jobs.ga-promote.outputs.digests }}
+      rc_digests:
+        description: "Contract RC image index digests keyed by artifact name (JSON)"
+        value: ${{ jobs.rc-images.outputs.digests }}
       draft_url:
         description: "GA path: URL of the draft release"
         value: ${{ jobs.draft-release.outputs.url }}
@@ -161,6 +168,8 @@ jobs:
     needs: classify
     if: needs.classify.outputs.kind == 'rc'
     runs-on: ${{ inputs.runner }}
+    outputs:
+      digests: ${{ steps.receipts.outputs.digests }}
     steps:
       - uses: actions/checkout@v7
       - name: Derive the Harbor host
@@ -188,7 +197,39 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Check out the release adapter
+        if: inputs.artifact_contract
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Install contract tools
+        if: inputs.artifact_contract
+        run: bash .release-kit/scripts/install-contract-tools.sh
+      - name: Recover image receipts from a previous attempt
+        if: inputs.artifact_contract && github.run_attempt != '1'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-input-${{ github.ref_name }}
+          merge-multiple: true
+          path: receipts
+      - name: Publish declared RC images and collect registry receipts
+        id: receipts
+        if: inputs.artifact_contract
+        run: |
+          mkdir -p receipts
+          python3 .release-kit/scripts/artifact-contract.py rc-images receipts/release-input.json
+          echo "digests=$(jq -ce '.components | map_values(.digest)' receipts/release-input.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: always() && inputs.artifact_contract && hashFiles('receipts/release-input.json') != ''
+        with:
+          name: image-input-${{ github.ref_name }}
+          path: receipts/release-input.json
+          overwrite: true
+          if-no-files-found: error
       - name: Build and push (multi-arch) through the Makefile contract
+        if: '!inputs.artifact_contract'
         run: |
           set -euo pipefail
           for img in $IMAGES; do
@@ -216,8 +257,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: Derive the Harbor host
         run: echo "HARBOR_HOST=${HARBOR_REGISTRY%%/*}" >> "$GITHUB_ENV"
+      - name: Check out the release adapter
+        if: inputs.artifact_contract
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Install contract tools
+        if: inputs.artifact_contract
+        run: bash .release-kit/scripts/install-contract-tools.sh
       - uses: azure/setup-helm@v5
       - name: Install yq
+        if: '!inputs.artifact_contract'
         run: |
           mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
@@ -233,9 +285,48 @@ jobs:
       # The rc chart must resolve this component's image from Harbor; the caller
       # says how through chart_rc_values because values layouts differ per chart.
       - name: Point the rc chart at Harbor
-        if: env.CHART_RC_VALUES != ''
+        if: ${{ !inputs.artifact_contract && env.CHART_RC_VALUES != '' }}
         run: yq -i "$CHART_RC_VALUES" "$CHART_DIR/values.yaml"
+      - uses: actions/download-artifact@v8
+        if: inputs.artifact_contract
+        with:
+          name: image-input-${{ github.ref_name }}
+          path: inputs
+      - name: Recover frozen operand selection on retry
+        if: inputs.artifact_contract && github.run_attempt != '1'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: component-input-${{ github.ref_name }}
+          merge-multiple: true
+          path: dist
+      - name: Freeze component RC versions
+        if: inputs.artifact_contract
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          echo "$HARBOR_PASSWORD" | helm registry login "$HARBOR_HOST" -u "$HARBOR_USERNAME" --password-stdin
+          regctl registry login "$HARBOR_HOST" -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
+          regctl registry login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_PASSWORD"
+          mkdir -p dist
+          if [ ! -f dist/release-input.json ]; then
+            make release-input RELEASE_PHASE=rc RELEASE_INPUT=inputs/release-input.json RELEASE_RESULT=dist/release-input.json
+          fi
+      - uses: actions/upload-artifact@v7
+        if: inputs.artifact_contract
+        with:
+          name: component-input-${{ github.ref_name }}
+          path: dist/release-input.json
+          overwrite: true
+          if-no-files-found: error
+      - name: Package and publish the frozen RC chart
+        if: inputs.artifact_contract
+        run: |
+          python3 .release-kit/scripts/artifact-contract.py publish-chart dist/release-input.json
       - name: Package chart
+        if: '!inputs.artifact_contract'
         run: |
           set -euo pipefail
           if yq -e '.dependencies' "$CHART_DIR/Chart.yaml" >/dev/null 2>&1; then
@@ -244,15 +335,20 @@ jobs:
           mkdir -p dist
           helm package "$CHART_DIR" --destination dist \
             --version "${GITHUB_REF_NAME#v}" --app-version "$GITHUB_REF_NAME"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helm-chart-${{ github.ref_name }}
-          path: dist/*.tgz
       - name: Push chart to Harbor
+        if: '!inputs.artifact_contract'
         run: |
           echo "${{ secrets.HARBOR_PASSWORD }}" | \
             helm registry login "$HARBOR_HOST" -u "${{ secrets.HARBOR_USERNAME }}" --password-stdin
           helm push dist/*.tgz "oci://$HARBOR_REGISTRY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: |
+            dist/*.tgz
+            dist/release-input.json
+          overwrite: true
+
 
   rc-prerelease:
     name: rc GitHub pre-release
@@ -270,10 +366,21 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: .release-kit
+      - uses: actions/download-artifact@v8
+        if: inputs.chart_dir != ''
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist
+      - uses: actions/download-artifact@v8
+        if: inputs.artifact_contract && inputs.chart_dir == ''
+        with:
+          name: image-input-${{ github.ref_name }}
+          path: dist
       - name: Release notes since the previous rc (or the previous GA)
         env:
           VERSION: ${{ needs.classify.outputs.version }}
           RELEASE_NOTES_EXTRA: ${{ inputs.release_notes_extra }}
+          RELEASE_INPUT: ${{ inputs.artifact_contract && 'dist/release-input.json' || '' }}
         run: |
           set -euo pipefail
           . .release-kit/scripts/lib.sh
@@ -285,18 +392,15 @@ jobs:
             echo
             cat release_notes.md
           } > body.md
-      - uses: actions/download-artifact@v8
-        if: inputs.chart_dir != ''
-        with:
-          name: helm-chart-${{ github.ref_name }}
-          path: dist
       - uses: softprops/action-gh-release@v3
         with:
           prerelease: true
           tag_name: ${{ github.ref_name }}
           name: "${{ inputs.release_name }} ${{ github.ref_name }} (release candidate)"
           body_path: body.md
-          files: dist/*.tgz
+          files: |
+            dist/*.tgz
+            dist/release-input.json
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -327,9 +431,10 @@ jobs:
           for r in "$R_IMAGES" "$R_CHART" "$R_PRERELEASE"; do
             case $r in failure|cancelled) color=danger;; esac
           done
+          chart=""
+          if [ -n "$CHART_DIR" ]; then chart="$(mark "$R_CHART") Helm chart → Harbor OCI"$'\n'; fi
           rows="$(mark "$R_IMAGES") Images → \`$HARBOR_REGISTRY\` (\`$GITHUB_REF_NAME\`, amd64 + arm64)
-          $(mark "$R_CHART") Helm chart → Harbor OCI
-          $(mark "$R_PRERELEASE") GitHub pre-release"
+          ${chart}$(mark "$R_PRERELEASE") GitHub pre-release"
           .release-kit/scripts/slack-notify.sh --color "$color" --details "$rows" \
             --link "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME|pre-release" \
             --title ":package: *${GITHUB_REPOSITORY#*/}* · *$GITHUB_REF_NAME* · rc published" \
@@ -367,6 +472,26 @@ jobs:
         run: |
           regctl registry login "$HARBOR_HOST" -u "${{ secrets.HARBOR_USERNAME }}" -p "${{ secrets.HARBOR_PASSWORD }}"
           regctl registry login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_PASSWORD }}"
+      - name: Install contract tools
+        if: inputs.artifact_contract
+        run: bash .release-kit/scripts/install-contract-tools.sh
+      - name: Load the accepted RC and check the public component images
+        if: inputs.artifact_contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_RC: ${{ needs.classify.outputs.last_rc }}
+        run: |
+          mkdir -p rc-input ga-input
+          gh release download "$LAST_RC" --pattern release-input.json --dir rc-input
+          python3 .release-kit/scripts/artifact-contract.py ga-input rc-input/release-input.json ga-input/release-input.json
+          echo "RELEASE_IMAGE_LOCK=$PWD/rc-input/release-input.json" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v7
+        if: inputs.artifact_contract
+        with:
+          name: ga-input-${{ github.ref_name }}
+          path: ga-input/release-input.json
+          overwrite: true
+          if-no-files-found: error
       - name: Copy the validated rc images by digest (no rebuild)
         id: copy
         env:
@@ -384,8 +509,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check out the release adapter
+        if: inputs.artifact_contract
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-kit
+      - name: Install contract tools
+        if: inputs.artifact_contract
+        run: bash .release-kit/scripts/install-contract-tools.sh
       - uses: azure/setup-helm@v5
       - name: Install yq
+        if: '!inputs.artifact_contract'
         run: |
           mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -sSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "$HOME/.local/bin/yq"
@@ -398,7 +534,22 @@ jobs:
           CHART_REPOS: ${{ inputs.chart_repos }}
         run: |
           for r in $CHART_REPOS; do helm repo add --force-update "${r%%=*}" "${r#*=}"; done
+      - uses: actions/download-artifact@v8
+        if: inputs.artifact_contract
+        with:
+          name: ga-input-${{ github.ref_name }}
+          path: dist
+      - name: Publish the chart from the promoted composition
+        if: inputs.artifact_contract
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          echo "$DOCKERHUB_PASSWORD" | helm registry login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          regctl registry login docker.io -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_PASSWORD"
+          python3 .release-kit/scripts/artifact-contract.py publish-chart dist/release-input.json
       - name: Package chart (pristine values)
+        if: '!inputs.artifact_contract'
         run: |
           set -euo pipefail
           if yq -e '.dependencies' "$CHART_DIR/Chart.yaml" >/dev/null 2>&1; then
@@ -407,15 +558,20 @@ jobs:
           mkdir -p dist
           helm package "$CHART_DIR" --destination dist \
             --version "${GITHUB_REF_NAME#v}" --app-version "$GITHUB_REF_NAME"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: helm-chart-${{ github.ref_name }}
-          path: dist/*.tgz
       - name: Push chart to Docker Hub OCI
+        if: '!inputs.artifact_contract'
         run: |
           echo "${{ secrets.DOCKERHUB_PASSWORD }}" | \
             helm registry login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
           helm push dist/*.tgz "oci://$DOCKERHUB_REGISTRY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: |
+            dist/*.tgz
+            dist/release-input.json
+          overwrite: true
+
 
   draft-release:
     name: GA release notes (draft)
@@ -434,23 +590,29 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: .release-kit
+      - uses: actions/download-artifact@v8
+        if: inputs.chart_dir != ''
+        with:
+          name: helm-chart-${{ github.ref_name }}
+          path: dist
+      - uses: actions/download-artifact@v8
+        if: inputs.artifact_contract && inputs.chart_dir == ''
+        with:
+          name: ga-input-${{ github.ref_name }}
+          path: dist
       # The previous GA is the highest GA tag below this one, not "the tag before
       # this one in history": release branches make git describe unreliable.
       - name: Generate release notes
         env:
           VERSION: ${{ needs.classify.outputs.version }}
           RELEASE_NOTES_EXTRA: ${{ inputs.release_notes_extra }}
+          RELEASE_INPUT: ${{ inputs.artifact_contract && 'dist/release-input.json' || '' }}
         run: |
           set -euo pipefail
           . .release-kit/scripts/lib.sh
           prev=$(prev_ga_tag "$GITHUB_REF_NAME")
           echo "previous GA: ${prev:-<none>}"
           .release-kit/scripts/release-notes.sh "$GITHUB_REF_NAME" "$prev" release_notes.md
-      - uses: actions/download-artifact@v8
-        if: inputs.chart_dir != ''
-        with:
-          name: helm-chart-${{ github.ref_name }}
-          path: dist
       - uses: softprops/action-gh-release@v3
         id: release
         with:
@@ -458,7 +620,9 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "${{ inputs.release_name }} ${{ github.ref_name }} Release"
           body_path: release_notes.md
-          files: dist/*.tgz
+          files: |
+            dist/*.tgz
+            dist/release-input.json
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -500,9 +664,10 @@ jobs:
             case $r in failure|cancelled) color=danger;; esac
           done
           tags="\`$GITHUB_REF_NAME\`"; [ "$LATEST" = true ] && tags="$tags, \`latest\`"
+          chart=""
+          if [ -n "$CHART_DIR" ]; then chart="$(mark "$R_CHART") Helm chart → docker.io OCI"$'\n'; fi
           rows="$(mark "$R_PROMOTE") Images promoted from \`$LAST_RC\` by digest → \`$DOCKERHUB_REGISTRY\` ($tags)
-          $(mark "$R_CHART") Helm chart \`${GITHUB_REF_NAME#v}\` → docker.io OCI
-          $(mark "$R_NOTES") Release notes drafted
+          ${chart}$(mark "$R_NOTES") Release notes drafted
           Backport label \`backport $BRANCH\` removed; the branch is read-only now"
           links=()
           [ -n "$DRAFT_URL" ] && links+=(--link "$DRAFT_URL|draft release")

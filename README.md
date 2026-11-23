@@ -57,3 +57,31 @@ remain fatal; only this optional Harbor job tolerates failures.
 
 Publish the new workflow and script under `v1` before merging caller jobs that
 reference them. Existing callers without this job keep their current behavior.
+
+## Piper artifact contract during migration
+
+Consumers opt in with `artifact_contract: true` and commit a schema-version-1
+`.piper/release.yaml` alongside their Makefile. Deploy this reusable workflow
+on the version referenced by consumers before merging those workflow changes.
+Existing callers without the option keep their current release path.
+
+The runner checks out the release commit and invokes:
+
+```sh
+make release-artifact ARTIFACT_KIND=image ARTIFACT_NAME=devicePlugin \
+  RELEASE_INPUT=/work/release-input.json RELEASE_RESULT=/work/result.json
+```
+
+The input contains `schemaVersion`, `sourceSha`, `phase`, `version`,
+`targetRegistry` (host/project) and `components`. Image repository names in
+the declaration are relative to that registry project. The result identifies
+`name` and `kind`; `output` is either a file path or a registry ref and
+its digest. An image build pushes only to the RC destination. GA copies the
+digest recorded in the RC release asset. The adapter cross-checks the declared
+images against the existing workflow input before building.
+
+Image-only projects omit chart inputs. For a product chart the repository's
+`make release-input` freezes dependencies at RC and translates them to verified
+public coordinates at GA. Both the chart package and the frozen input are
+attached to the GitHub release. Keep the tag workflow, validation and GA
+mirroring active until Piper takes over publication.

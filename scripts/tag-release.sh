@@ -37,7 +37,9 @@ last_rc=$(last_rc_tag "$version")
 
 case $kind in
 rc)
-	if [ -n "$last_rc" ] && [ "$(git rev-parse "$last_rc^{commit}")" = "$head" ]; then
+	context=$(rc_status_context "$head" "$last_rc")
+	if [ -n "$last_rc" ] && [ "$(git rev-parse "$last_rc^{commit}")" = "$head" ] &&
+		[ "$context" = rc-validation ]; then
 		fail "HEAD of $branch is already tagged $last_rc; nothing new to release"
 	fi
 	if [ -n "$last_rc" ]; then
@@ -53,12 +55,13 @@ ga)
 	rc_sha=$(git rev-parse "$last_rc^{commit}")
 	[ "$rc_sha" = "$head" ] ||
 		fail "HEAD of $branch (${head:0:12}) is not the commit of $last_rc (${rc_sha:0:12}); tag a new rc and validate it first"
-	state=$(commit_status_state "$head" rc-validation)
+	context=$(rc_status_context "$head" "$last_rc")
+	state=$(commit_status_state "$head" "$context")
 	if [ "$state" = success ]; then
 		note "rc-validation on $last_rc is success"
 	else
 		status_msg="rc-validation status on $last_rc (${head:0:12}) is '$state', not 'success'"
-		if [ "${RC_VALIDATION_ENFORCE:-}" = true ]; then
+		if [ "$context" != rc-validation ] || [ "${RC_VALIDATION_ENFORCE:-}" = true ]; then
 			fail "$status_msg. 'error' = validation infrastructure failed, rebuild it; 'failure' = the rc is broken, fix on main and cut a new rc; 'none' = it never ran."
 		fi
 		echo "WARN: $status_msg; continuing because RC_VALIDATION_ENFORCE is not 'true'" >&2
