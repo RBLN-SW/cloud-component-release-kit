@@ -23,34 +23,52 @@ backport_head() {
 	commit "fix: leak" fix.txt >/dev/null
 	git push -q origin main
 	backport_head
-	PR_TITLE="fix: leak" run "$SCRIPTS/release-policy.sh"
+	run "$SCRIPTS/release-policy.sh"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"all checks passed"* ]]
 }
 
-@test "a feat title is refused on a release branch" {
-	commit "feat: thing" f.txt >/dev/null
+@test "a clean cherry-pick passes when nearby unchanged lines differ" {
+	printf 'old\nunchanged\nrelease context\n' >config.txt
+	git add config.txt
+	git commit -qm "chore: add config"
+	git branch -f "$BASE_REF" HEAD
+	git push -q origin "$BASE_REF"
+
+	printf 'old\nunchanged\nmain context\n' >config.txt
+	git commit -qam "chore: update main context"
+	printf 'fixed\nunchanged\nmain context\n' >config.txt
+	git commit -qam "fix: update config"
 	git push -q origin main
 	backport_head
-	PR_TITLE="feat: thing" run "$SCRIPTS/release-policy.sh"
+
+	run "$SCRIPTS/release-policy.sh"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"clean cherry-pick"* ]]
+
+	echo extra >>config.txt
+	git commit -q --amend --no-edit -a
+	run "$SCRIPTS/release-policy.sh"
 	[ "$status" -ne 0 ]
-	[[ "$output" == *"title: type must be one of"* ]]
+	[[ "$output" == *"content differs from origin"* ]]
 }
 
-@test "a breaking marker is refused on a release branch" {
-	commit "fix!: thing" f.txt >/dev/null
+@test "a clean backport passes regardless of its PR title" {
+	commit "feat: add an option" option.txt >/dev/null
 	git push -q origin main
 	backport_head
-	PR_TITLE="fix!: thing" run "$SCRIPTS/release-policy.sh"
-	[ "$status" -ne 0 ]
-	[[ "$output" == *"breaking change marker"* ]]
+	for title in "feat: add an option" "fix(api)!: rename the option" "Backport the option"; do
+		PR_TITLE="$title" run "$SCRIPTS/release-policy.sh"
+		[ "$status" -eq 0 ]
+		[[ "$output" == *"all checks passed"* ]]
+	done
 }
 
 @test "a commit without a cherry-pick trailer is refused" {
 	git checkout -q release-0.5.0
 	commit "fix: direct" d.txt >/dev/null
 	git checkout -q --detach
-	PR_TITLE="fix: direct" run "$SCRIPTS/release-policy.sh"
+	run "$SCRIPTS/release-policy.sh"
 	[ "$status" -ne 0 ]
 	[[ "$output" == *"no '(cherry picked from commit"* ]]
 }
@@ -59,10 +77,10 @@ backport_head() {
 	git checkout -q release-0.5.0
 	commit "fix: direct" d.txt >/dev/null
 	git checkout -q --detach
-	PR_TITLE="fix: direct" PR_LABELS_JSON='["release-only"]' PR_BODY="no reason given" run "$SCRIPTS/release-policy.sh"
+	PR_LABELS_JSON='["release-only"]' PR_BODY="no reason given" run "$SCRIPTS/release-policy.sh"
 	[ "$status" -ne 0 ]
 	[[ "$output" == *"Why not main"* ]]
-	PR_TITLE="fix: direct" PR_LABELS_JSON='["release-only"]' PR_BODY=$'## Why not main\nmain removed this code' run "$SCRIPTS/release-policy.sh"
+	PR_LABELS_JSON='["release-only"]' PR_BODY=$'## Why not main\nmain removed this code' run "$SCRIPTS/release-policy.sh"
 	[ "$status" -eq 0 ]
 }
 
@@ -72,12 +90,30 @@ backport_head() {
 	backport_head
 	echo extra >>fix.txt
 	git commit -q --amend --no-edit -a
-	PR_TITLE="fix: leak" run "$SCRIPTS/release-policy.sh"
+	run "$SCRIPTS/release-policy.sh"
 	[ "$status" -ne 0 ]
 	[[ "$output" == *"content differs from origin"* ]]
-	PR_TITLE="fix: leak" PR_LABELS_JSON='["backport-manual"]' run "$SCRIPTS/release-policy.sh"
+	PR_LABELS_JSON='["backport-manual"]' run "$SCRIPTS/release-policy.sh"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"accepted: backport-manual"* ]]
+}
+
+@test "a conflicting cherry-pick still requires the manual label" {
+	commit "fix: main defaults" defaults.txt >/dev/null
+	git push -q origin main
+	git checkout -q "$BASE_REF"
+	commit "chore: release defaults" defaults.txt >/dev/null
+	git push -q origin "$BASE_REF"
+
+	run git cherry-pick -x main
+	[ "$status" -eq 1 ]
+	echo resolved >defaults.txt
+	git add defaults.txt
+	git commit -qm "fix: main defaults" -m "(cherry picked from commit $(git rev-parse main))"
+
+	run "$SCRIPTS/release-policy.sh"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"content differs from origin"* ]]
 }
 
 @test "GENERATED_PATHS removes paths from the advisory size count" {
@@ -88,7 +124,7 @@ backport_head() {
 	git add -A
 	git commit -q -m "chore: generated"
 	git checkout -q --detach
-	export PR_TITLE="chore: generated" PR_LABELS_JSON='["release-only"]' PR_BODY="Why not main: generated on the branch"
+	export PR_LABELS_JSON='["release-only"]' PR_BODY="Why not main: generated on the branch"
 	run "$SCRIPTS/release-policy.sh"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"warn  500 changed lines"* ]]
