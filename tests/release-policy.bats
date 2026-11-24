@@ -28,6 +28,31 @@ backport_head() {
 	[[ "$output" == *"all checks passed"* ]]
 }
 
+@test "a clean cherry-pick passes when nearby unchanged lines differ" {
+	printf 'old\nunchanged\nrelease context\n' >config.txt
+	git add config.txt
+	git commit -qm "chore: add config"
+	git branch -f "$BASE_REF" HEAD
+	git push -q origin "$BASE_REF"
+
+	printf 'old\nunchanged\nmain context\n' >config.txt
+	git commit -qam "chore: update main context"
+	printf 'fixed\nunchanged\nmain context\n' >config.txt
+	git commit -qam "fix: update config"
+	git push -q origin main
+	backport_head
+
+	PR_TITLE="fix: update config" run "$SCRIPTS/release-policy.sh"
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"clean cherry-pick"* ]]
+
+	echo extra >>config.txt
+	git commit -q --amend --no-edit -a
+	PR_TITLE="fix: update config" run "$SCRIPTS/release-policy.sh"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"content differs from origin"* ]]
+}
+
 @test "a feat title is refused on a release branch" {
 	commit "feat: thing" f.txt >/dev/null
 	git push -q origin main
@@ -78,6 +103,24 @@ backport_head() {
 	PR_TITLE="fix: leak" PR_LABELS_JSON='["backport-manual"]' run "$SCRIPTS/release-policy.sh"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"accepted: backport-manual"* ]]
+}
+
+@test "a conflicting cherry-pick still requires the manual label" {
+	commit "fix: main defaults" defaults.txt >/dev/null
+	git push -q origin main
+	git checkout -q "$BASE_REF"
+	commit "chore: release defaults" defaults.txt >/dev/null
+	git push -q origin "$BASE_REF"
+
+	run git cherry-pick -x main
+	[ "$status" -eq 1 ]
+	echo resolved >defaults.txt
+	git add defaults.txt
+	git commit -qm "fix: main defaults" -m "(cherry picked from commit $(git rev-parse main))"
+
+	PR_TITLE="fix: main defaults" run "$SCRIPTS/release-policy.sh"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"content differs from origin"* ]]
 }
 
 @test "GENERATED_PATHS removes paths from the advisory size count" {

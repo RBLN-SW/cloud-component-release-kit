@@ -12,7 +12,7 @@
 #                                  <sha>)"
 #   4  origin is on main           trailer sha unknown or not an ancestor of     block (skipped with release-only)
 #                                  origin/main
-#   5  content equals origin       git patch-id differs from the origin commit   block unless labelled backport-manual
+#   5  content equals origin       neither patch-id nor a clean replay matches   block unless labelled backport-manual
 #   6  release-only rationale      release-only label without a "why not main"   block
 #                                  section in the PR body
 #   7  size                        >SIZE_LIMIT changed lines outside             comment only
@@ -46,6 +46,17 @@ problem() {
 }
 pass() { echo "ok    $*"; }
 has_label() { grep -qx -- "$1" <<<"$PR_LABELS"; }
+
+matches_clean_cherry_pick() {
+	local backport=$1 origin=$2 origin_parent replay_tree
+	origin_parent=$(git show -s --format=%P "$origin")
+	# The backport workflow cherry-picks single-parent commits from main.
+	[[ -n $origin_parent && $origin_parent != *" "* ]] || return 1
+	# Replay only the origin's change onto this backport's parent. merge-tree
+	# also emits a tree on conflict, so require success before comparing it.
+	replay_tree=$(git merge-tree --write-tree --merge-base="$origin_parent" "$backport^" "$origin") || return 1
+	[[ $replay_tree == "$(git rev-parse "$backport^{tree}")" ]]
+}
 
 git fetch --quiet origin main "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
 base="origin/$BASE_REF"
@@ -96,6 +107,8 @@ else
 			pid_o=$(git show "$o" | git patch-id --stable | cut -d' ' -f1)
 			if [ "$pid_c" = "$pid_o" ]; then
 				pass "$short: identical to main commit ${o:0:12}"
+			elif matches_clean_cherry_pick "$c" "$o"; then
+				pass "$short: clean cherry-pick of main commit ${o:0:12}"
 			elif has_label backport-manual; then
 				pass "$short: differs from ${o:0:12} (accepted: backport-manual)"
 			else
