@@ -7,9 +7,8 @@ defaults:
     shell: bash
 
 # Reusable workflow: required status check for pull requests into release-*
-# branches. Proves that every change is a fix already merged on main, carried
-# over unchanged (or a labelled, justified exception). See
-# scripts/release-policy.sh for the seven checks.
+# branches. Verifies the origin and content of backports selected by
+# maintainers. See scripts/release-policy.sh for the checks and exceptions.
 #
 # The caller's stub (templates/workflows/release-policy.yaml) runs on
 # pull_request for release-* including labeled/unlabeled, because two checks
@@ -50,7 +49,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           GENERATED_PATHS: ${{ inputs.generated_paths }}
